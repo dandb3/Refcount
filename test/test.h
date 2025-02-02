@@ -3,14 +3,14 @@ typedef long atomic_long_t;
 typedef long atomic64_t;
 
 atomic_t elearn;
+typedef struct refcount_struct {
+    atomic_t refs;
+} refcount_t;
 struct kref {
-    atomic_t one;
-};
-struct refcount_t {
-    atomic64_t two;
+    refcount_t refcount;
 };
 struct krefkref {
-    atomic64_t two;
+    atomic_t two;
 };
 
 void wow12() {

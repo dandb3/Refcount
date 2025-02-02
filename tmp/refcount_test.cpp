@@ -16,8 +16,9 @@
 #include <iomanip>
 #include <stddef.h>
 
-#define LOG_DIR "/home/jdoh/test/refcount_pair/log/"
-#define COMPILE_DATABASE "/home/jdoh/test/refcount_pair/compile_commands.json"
+#define TEST_DIR "new"
+#define LOG_DIR "/home/jdoh/test/" TEST_DIR "/log/"
+#define COMPILE_DATABASE "/home/jdoh/test/" TEST_DIR "/compile_commands.json"
 
 using namespace llvm;
 using namespace clang;
@@ -70,17 +71,17 @@ class WarningDiagConsumer : public DiagnosticConsumer {
 
 static std::ofstream total_output;
 
-const RecordDecl *getTopLevelStruct(const FieldDecl *field) {
-    const DeclContext *tmp = dyn_cast<DeclContext>(field->getParent());
-    const RecordDecl *parent = nullptr;
+// const RecordDecl *getTopLevelStruct(const FieldDecl *field) {
+//     const DeclContext *tmp = dyn_cast<DeclContext>(field->getParent());
+//     const RecordDecl *parent = nullptr;
 
-    while (dyn_cast<RecordDecl>(tmp)) {
-        parent = dyn_cast<RecordDecl>(tmp);
-        tmp = parent->getParent();
-    }
+//     while (dyn_cast<RecordDecl>(tmp)) {
+//         parent = dyn_cast<RecordDecl>(tmp);
+//         tmp = parent->getParent();
+//     }
 
-    return parent;
-}
+//     return parent;
+// }
 
 enum APIType {
     SET,
@@ -100,6 +101,7 @@ typedef std::pair<std::string, unsigned int> RefcntKey;
 typedef std::pair<APIType, int> RefcntVal;
 typedef std::map<RefcntKey, std::vector<RefcntVal>> RefcntMap;
 static RefcntMap refcntCandidates;
+static std::set<std::string> funcNames;
 
 class FieldTypeCallback : public MatchFinder::MatchCallback {
     private:
@@ -151,13 +153,6 @@ class FieldTypeCallback : public MatchFinder::MatchCallback {
         }
 
         files.insert(logFile);
-
-        const auto &structName = getTopLevelStruct(node)->getName();
-        // llvm::outs() << "Struct: " << structName << "\n";
-
-        if (structName == "kref" || structName == "refcount_struct") {
-            return;
-        }
 
         refcntCandidates.insert({
             RefcntKey({srcFile, SM.getExpansionLineNumber(loc)}),
@@ -296,6 +291,8 @@ class ArgTypeCallback : public MatchFinder::MatchCallback {
         const std::string &calleeName = node->getDirectCallee()->getNameAsString();
         bool err;
 
+        funcNames.insert(calleeName);
+
         if (calleeName.find("init") != std::string::npos) {
             err = setKeyVal(SM, node, APIType::SET, APIArgType::REF_ONLY, 1, 1);
         }
@@ -354,7 +351,11 @@ class FieldTypeASTConsumer : public ASTConsumer {
                         "refcount_t"
                     ))),
                     hasType(recordDecl(hasName("kref")))
-                )
+                ),
+                unless(hasAncestor(recordDecl(hasAnyName(
+                    "kref",
+                    "refcount_struct"
+                ))))
             ).bind("fieldType"),
             callback
         );
@@ -384,8 +385,7 @@ class ArgTypeASTConsumer : public ASTConsumer {
 
         Matcher.addMatcher(
             callExpr(callee(functionDecl(
-                matchesName("(kref_|atomic_|atomic_long_|atomic64_)"),
-                matchesName("(_set|_add|_sub|_inc|_dec|_init|_get|_put)")
+                matchesName("^::(kref_|atomic_|atomic_long_|atomic64_|refcount_).*(set|add|sub|inc|dec|init|get|put).*")
             ))).bind("argType"),
             callback
         );
@@ -538,8 +538,10 @@ int main(int argc, const char** argv)
         ClangTool Tool(OptionsParser->getCompilations(), files);
         Tool.setDiagnosticConsumer(new WarningDiagConsumer);
         Tool.run(newFrontendActionFactory<FieldTypeFrontEndAction>().get());
+        system("rm -rf " LOG_DIR "*");
 
         Tool.run(newFrontendActionFactory<ArgTypeFrontEndAction>().get());
+        system("rm -rf " LOG_DIR "*");
         for (auto &elem : refcntCandidates) {
             llvm::outs() << "Path: " << elem.first.first << ", "
                          << "Line: " << elem.first.second << "\n";
@@ -554,6 +556,9 @@ int main(int argc, const char** argv)
                 }
                 llvm::outs() << el.second << ">\n";
             }
+        }
+        for (auto &elem : funcNames) {
+            llvm::outs() << elem << "\n";
         }
     }
     else {
@@ -575,7 +580,7 @@ int main(int argc, const char** argv)
         Tool.run(newFrontendActionFactory<ArgTypeFrontEndAction>().get());
         system("rm -rf " LOG_DIR "*");
 
-        total_output.open(LOG_DIR "beforelog.txt");
+        total_output.open(LOG_DIR "beforeRules.log");
         if (!total_output.is_open()) {
             llvm::errs() << "output file open failed!\n";
             return EXIT_FAILURE;
@@ -598,7 +603,7 @@ int main(int argc, const char** argv)
         }
 
         total_output.close();
-        total_output.open(LOG_DIR "afterlog.txt");
+        total_output.open(LOG_DIR "afterRules.log");
         if (!total_output.is_open()) {
             llvm::errs() << "output file open failed!\n";
             return EXIT_FAILURE;
@@ -627,6 +632,12 @@ int main(int argc, const char** argv)
                 }
                 total_output << el.second << ">\n";
             }
+        }
+        total_output.close();
+
+        total_output.open(LOG_DIR "funcNames.log");
+        for (auto &elem : funcNames) {
+            total_output << elem << "\n";
         }
         total_output.close();
     }

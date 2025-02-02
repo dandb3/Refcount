@@ -14,9 +14,11 @@
 #include <fstream>
 #include <iostream>
 #include <iomanip>
+#include <stddef.h>
 
-#define LOG_DIR "/home/jdoh/test/refcount_count/log/"
-#define COMPILE_DATABASE "/home/jdoh/test/refcount_count/compile_commands.json"
+#define TEST_DIR "new"
+#define LOG_DIR "/home/jdoh/test/" TEST_DIR "/log/"
+#define COMPILE_DATABASE "/home/jdoh/test/" TEST_DIR "/compile_commands.json"
 
 using namespace llvm;
 using namespace clang;
@@ -66,35 +68,44 @@ class WarningDiagConsumer : public DiagnosticConsumer {
 // doing the actual code analysis
 //
 // ...
-class Refcnt {
-    public:
-    int atomic_t_cnt;
-    int atomic_long_t_cnt;
-    int atomic64_t_cnt;
-    int refcount_t_cnt;
-    int kref_cnt;
-    
-    Refcnt()
-    : atomic_t_cnt(0), atomic_long_t_cnt(0), atomic64_t_cnt(0),
-        refcount_t_cnt(0), kref_cnt(0)
-    {}
-
-    Refcnt &operator+=(const Refcnt &refcnt) {
-        atomic_t_cnt += refcnt.atomic_t_cnt;
-        atomic_long_t_cnt += refcnt.atomic_long_t_cnt;
-        atomic64_t_cnt += refcnt.atomic64_t_cnt;
-        refcount_t_cnt += refcnt.refcount_t_cnt;
-        kref_cnt += refcnt.kref_cnt;
-        return *this;
-    }
-};
 
 static std::ofstream total_output;
-static Refcnt total_refcnt;
 
-class TypeCheck : public MatchFinder::MatchCallback {
+// const RecordDecl *getTopLevelStruct(const FieldDecl *field) {
+//     const DeclContext *tmp = dyn_cast<DeclContext>(field->getParent());
+//     const RecordDecl *parent = nullptr;
+
+//     while (dyn_cast<RecordDecl>(tmp)) {
+//         parent = dyn_cast<RecordDecl>(tmp);
+//         tmp = parent->getParent();
+//     }
+
+//     return parent;
+// }
+
+enum APIType {
+    SET,
+    DIFF,
+    ERROR
+};
+
+enum APIArgType {
+    REF_ONLY, // ex) atomic_inc(atomic_t *v);
+    REF_VAL,  // ex) atomic_set(atomic_t *v, int i);
+    VAL_REF   // ex) atomic_add(int i, atomic_t *v);
+};
+
+// key = { path, line}
+// value = { { SET, 1 }, { ADD, 1 }, { SUB, 1 }, ... }
+typedef std::pair<std::string, unsigned int> RefcntKey;
+typedef std::pair<APIType, int> RefcntVal;
+typedef std::map<RefcntKey, std::vector<RefcntVal>> RefcntMap;
+static RefcntMap refcntCandidates;
+static std::set<std::string> funcNames;
+
+class FieldTypeCallback : public MatchFinder::MatchCallback {
     private:
-    std::map<std::string, std::pair<std::stringstream, Refcnt>> files;
+    std::set<std::string> files;
 
     public:
     virtual void onStartOfTranslationUnit() override {
@@ -106,92 +117,207 @@ class TypeCheck : public MatchFinder::MatchCallback {
         std::ofstream ofs;
 
         for (auto &elem : files) {
-            logFileDir = elem.first.substr(0, elem.first.rfind('/'));
+            logFileDir = elem.substr(0, elem.rfind('/'));
             if (access(logFileDir.c_str(), F_OK) != 0) {
                 system(("mkdir -p " + logFileDir).c_str());
             }
-            
-            ofs.open(elem.first);
+            ofs.open(elem);
             if (!ofs.is_open()) {
-                llvm::errs() << "Log file " << elem.first << " open failed!\n";
+                llvm::errs() << "Log file '" << elem << "' creation failed!\n";
                 exit(1);
             }
-            ofs << elem.second.first.str();
-            ofs << "atomic_t: " << elem.second.second.atomic_t_cnt << "\n"
-                << "atomic_long_t: " << elem.second.second.atomic_long_t_cnt << "\n"
-                << "atomic64_t: " << elem.second.second.atomic64_t_cnt << "\n"
-                << "refcount_t: " << elem.second.second.refcount_t_cnt << "\n"
-                << "kref: " << elem.second.second.kref_cnt << "\n";
             ofs.close();
-            total_refcnt += elem.second.second;
         }
     }
 
     virtual void run(const MatchFinder::MatchResult& Result) override {
-        const clang::DeclaratorDecl *node = Result.Nodes.getNodeAs<clang::DeclaratorDecl>("refcntType");
+        const clang::FieldDecl *node = Result.Nodes.getNodeAs<clang::FieldDecl>("fieldType");
 
         if (node == nullptr) {
             return;
         }
-        
+
         const auto &SM = *Result.SourceManager;
         const auto &loc = node->getBeginLoc();
         const auto &srcFile = SM.getFilename(SM.getSpellingLoc(loc)).str();
         std::string logFile;
 
         if (srcFile.empty()) {
-            llvm::errs() << "Path empty!\n";
+            llvm::outs() << "Path empty!\n";
             return;
         }
         logFile = LOG_DIR + srcFile;
-        // llvm::outs() << "srcFile: " << srcFile << "\n";
-        // llvm::outs() << "logFile: " << logFile << "\n";
 
         if (access(logFile.c_str(), F_OK) == 0) {
             return;
         }
 
-        auto &pair = files.insert({logFile, std::pair<std::stringstream, Refcnt>()}).first->second;
-        const std::string &type = node->getType().getAsString();
-        
-        if (type == "atomic_t") {
-            ++pair.second.atomic_t_cnt;
-        } else if (type == "atomic_long_t") {
-            ++pair.second.atomic_long_t_cnt;
-        } else if (type == "atomic64_t") {
-            ++pair.second.atomic64_t_cnt;
-        } else if (type == "refcount_t") {
-            ++pair.second.refcount_t_cnt;
-        } else if (type == "struct kref") {
-            ++pair.second.kref_cnt;
-        }
+        files.insert(logFile);
 
-        std::string rowcol = std::to_string(SM.getExpansionLineNumber(loc)) + ":" + std::to_string(SM.getExpansionColumnNumber(loc));
-
-        pair.first << std::left << std::setw(10) << rowcol
-                   << "Name: " << std::setw(20) << node->getName().str()
-                   << "Type: " << node->getType().getAsString() << "\n";
+        refcntCandidates.insert({
+            RefcntKey({srcFile, SM.getExpansionLineNumber(loc)}),
+            std::vector<RefcntVal>()
+        });
     }
 };
 
-// class IncludeRewriteCallback : public clang::PPCallbacks {
-//     public:
-//     virtual void InclusionDirective(
-//         SourceLocation HashLoc,
-//         const Token &IncludeTok, StringRef FileName,
-//         bool IsAngled, CharSourceRange FilenameRange,
-//         OptionalFileEntryRef File,
-//         StringRef SearchPath, StringRef RelativePath,
-//         const Module *SuggestedModule,
-//         bool ModuleImported,
-//         SrcMgr::CharacteristicKind FileType) override {
-        
-//     }
+class ArgTypeCallback : public MatchFinder::MatchCallback {
+    private:
+    std::set<std::string> files;
 
-//     private:
-//     Rewriter rewriter;
-//     const SourceManager &SM;
-// };
+    RefcntMap::iterator getIter(const clang::SourceManager &SM, const Expr *refcntArg) {
+        RefcntMap::iterator ret = refcntCandidates.end();
+
+        refcntArg = refcntArg->IgnoreParenImpCasts();
+        while (const auto *unaryOp = dyn_cast<UnaryOperator>(refcntArg)) {
+            refcntArg = unaryOp->getSubExpr()->IgnoreParenImpCasts();
+        }
+
+        if (const auto *memberExpr = dyn_cast<MemberExpr>(refcntArg)) {
+            if (const auto *fieldDecl = dyn_cast<FieldDecl>(memberExpr->getMemberDecl())) {
+                SourceLocation loc = fieldDecl->getBeginLoc();
+                ret = refcntCandidates.find({SM.getFilename(loc).str(), SM.getExpansionLineNumber(loc)});
+            }
+        }
+        return ret;
+    }
+    
+    RefcntVal getVal(const Expr *valArg, APIType apiType, long long diff, long long sign) {
+        if (valArg != nullptr) {
+            valArg = valArg->IgnoreParenImpCasts();
+
+            if (const auto *unaryOp = dyn_cast<UnaryOperator>(valArg)) {
+                if (unaryOp->getOpcode() == UO_Minus) {
+                    sign *= -1;
+                    valArg = unaryOp->getSubExpr()->IgnoreParenImpCasts();
+                }
+            }
+
+            if (const auto *intLit = dyn_cast<IntegerLiteral>(valArg)) {
+                diff = intLit->getValue().getSExtValue();
+            }
+            else {
+                llvm::errs() << "Argument is not literal!\n";
+                // node->dump();
+                return {APIType::ERROR, 0};
+            }
+        }
+        diff *= sign;
+        return {apiType, diff};
+    }
+
+    bool setKeyVal(const clang::SourceManager &SM, const CallExpr *node, APIType apiType, APIArgType argType, long long diff, long long sign) {
+        const Expr *refcntArg, *valArg;
+
+        auto argIt = node->arg_begin();
+
+        switch (argType) {
+        case APIArgType::REF_ONLY:
+            refcntArg = *argIt;
+            valArg = nullptr;
+            break;
+        case APIArgType::REF_VAL:
+            refcntArg = *argIt;
+            valArg = *(++argIt);
+            break;
+        case APIArgType::VAL_REF:
+            valArg = *argIt;
+            refcntArg = *(++argIt);
+            break;
+        }
+
+        auto mapIt = getIter(SM, refcntArg);
+        if (mapIt == refcntCandidates.end()) {
+            return true;
+        }
+
+        auto val = getVal(valArg, apiType, diff, sign);
+        if (val.first == APIType::ERROR) {
+            return true;
+        }
+
+        mapIt->second.push_back(val);
+        return false;
+    }
+
+    public:
+    virtual void onStartOfTranslationUnit() override {
+        
+    }
+
+    virtual void onEndOfTranslationUnit() override {
+        std::string logFileDir;
+        std::ofstream ofs;
+
+        for (auto &elem : files) {
+            logFileDir = elem.substr(0, elem.rfind('/'));
+            if (access(logFileDir.c_str(), F_OK) != 0) {
+                system(("mkdir -p " + logFileDir).c_str());
+            }
+            ofs.open(elem);
+            if (!ofs.is_open()) {
+                llvm::errs() << "Log file '" << elem << "' creation failed!\n";
+                exit(1);
+            }
+            ofs.close();
+        }
+    }
+
+    virtual void run(const MatchFinder::MatchResult& Result) override {
+        const clang::CallExpr *node = Result.Nodes.getNodeAs<clang::CallExpr>("argType");
+
+        if (node == nullptr) {
+            llvm::errs() << "node not matching argType!\n";
+            return;
+        }
+
+        const auto &SM = *Result.SourceManager;
+        const auto &loc = node->getBeginLoc();
+        const auto &srcFile = SM.getFilename(SM.getSpellingLoc(loc)).str();
+        std::string logFile;
+
+        if (srcFile.empty()) {
+            llvm::outs() << "Path empty!\n";
+            return;
+        }
+        logFile = LOG_DIR + srcFile;
+
+        if (access(logFile.c_str(), F_OK) == 0) {
+            return;
+        }
+
+        files.insert(logFile);
+
+        const std::string &calleeName = node->getDirectCallee()->getNameAsString();
+        bool err;
+
+        funcNames.insert(calleeName);
+
+        if (calleeName.find("init") != std::string::npos) {
+            err = setKeyVal(SM, node, APIType::SET, APIArgType::REF_ONLY, 1, 1);
+        }
+        else if (calleeName.find("get") != std::string::npos
+            || calleeName.find("inc") != std::string::npos) {
+            err = setKeyVal(SM, node, APIType::DIFF, APIArgType::REF_ONLY, 1, 1);
+        }
+        else if (calleeName.find("put") != std::string::npos
+            || calleeName.find("dec") != std::string::npos) {
+            err = setKeyVal(SM, node, APIType::DIFF, APIArgType::REF_ONLY, 1, -1);
+        }
+        else if (calleeName.find("set") != std::string::npos) {
+            err = setKeyVal(SM, node, APIType::SET, APIArgType::REF_VAL, 0, 1);
+        }
+        else if (calleeName.find("add_unless") != std::string::npos) {
+            err = setKeyVal(SM, node, APIType::DIFF, APIArgType::REF_VAL, 0, 1);
+        }
+        else if (calleeName.find("add") != std::string::npos) {
+            err = setKeyVal(SM, node, APIType::DIFF, APIArgType::VAL_REF, 0, 1);
+        }
+        else if (calleeName.find("sub") != std::string::npos) {
+            err = setKeyVal(SM, node,APIType::DIFF,  APIArgType::VAL_REF, 0, -1);
+        }
+    }
+};
 
 // ----------------------------------------------------------------------------
 // REGISTERING CALLBACKS
@@ -200,10 +326,11 @@ class TypeCheck : public MatchFinder::MatchCallback {
 // The ASTConsumer allows us to dictate:
 //      - which AST nodes we match, and
 //      - how we want to handle those matched nodes
-class RefcntASTConsumer : public ASTConsumer {
+
+class FieldTypeASTConsumer : public ASTConsumer {
 
     public:
-    RefcntASTConsumer(clang::Preprocessor& PP) {
+    FieldTypeASTConsumer(clang::Preprocessor& PP) {
     
         // Here we add all of the checks that should be run
         // when the AST is traversed by using Matcher.addMatcher
@@ -212,7 +339,7 @@ class RefcntASTConsumer : public ASTConsumer {
 
         // PP.addPPCallbacks(std::make_unique<clang::PPCallbacks>());
 
-        auto *callback = new TypeCheck;
+        auto *callback = new FieldTypeCallback;
 
         Matcher.addMatcher(
             fieldDecl(
@@ -227,33 +354,44 @@ class RefcntASTConsumer : public ASTConsumer {
                 ),
                 unless(hasAncestor(recordDecl(hasAnyName(
                     "kref",
-                    "refcount_t"
+                    "refcount_struct"
                 ))))
-            ).bind("refcntType"),
+            ).bind("fieldType"),
             callback
         );
-        // Matcher.addMatcher(
-        //     declaratorDecl(
-        //         matchesName(".*ref.*"),
-        //         unless(anyOf(
-        //             hasType(typedefNameDecl(hasAnyName(
-        //                 "atomic_t",
-        //                 "atomic_long_t",
-        //                 "atomic64_t",
-        //                 "refcount_t"
-        //             ))),
-        //             hasType(recordDecl(hasName("kref")))
-        //         )),
-        //         anyOf(
-        //             varDecl(),
-        //             fieldDecl()
-        //         )
-        //     ).bind("refcntName"),
-        //     callback
-        // );
     }
 
-    void HandleTranslationUnit(ASTContext& Context) override {
+    virtual void HandleTranslationUnit(ASTContext& Context) override {
+        Matcher.matchAST(Context);
+    }
+
+    private:
+    MatchFinder Matcher;
+};
+
+class ArgTypeASTConsumer : public ASTConsumer {
+
+    public:
+    ArgTypeASTConsumer(clang::Preprocessor& PP) {
+    
+        // Here we add all of the checks that should be run
+        // when the AST is traversed by using Matcher.addMatcher
+
+        // At the moment, there are no checks registered
+
+        // PP.addPPCallbacks(std::make_unique<clang::PPCallbacks>());
+
+        auto *callback = new ArgTypeCallback;
+
+        Matcher.addMatcher(
+            callExpr(callee(functionDecl(
+                matchesName("^::(kref_|atomic_|atomic_long_|atomic64_|refcount_).*(set|add|sub|inc|dec|init|get|put).*")
+            ))).bind("argType"),
+            callback
+        );
+    }
+
+    virtual void HandleTranslationUnit(ASTContext& Context) override {
         Matcher.matchAST(Context);
     }
 
@@ -265,7 +403,8 @@ class RefcntASTConsumer : public ASTConsumer {
 // and allows us to add callbacks via:
 //      PPCallback classes  - for callbacks involving the preprocessor
 //      ASTConsumer classes - for callbacks involving AST nodes 
-class RefcntFrontEndAction : public ASTFrontendAction {
+
+class FieldTypeFrontEndAction : public ASTFrontendAction {
 
     public:
     virtual bool BeginSourceFileAction(CompilerInstance &CI) override {
@@ -285,22 +424,41 @@ class RefcntFrontEndAction : public ASTFrontendAction {
         // At the moment, there are no checks registered
 
         return std::unique_ptr<ASTConsumer>(
-                new RefcntASTConsumer(CI.getPreprocessor()));
+                new FieldTypeASTConsumer(CI.getPreprocessor()));
     }
 
     virtual void EndSourceFileAction() override {
         
     }
-
-    // virtual bool ParseArgs(
-    //     const CompilerInstance &CI,
-    //     const std::vector<std::string> &Args
-    // ) override {
-    //     return true;
-    // }
 };
 
-// static FrontendPluginRegistry::Add<RefcntFrontEndAction> X("refcnt-plugin", "find refcnt");
+class ArgTypeFrontEndAction : public ASTFrontendAction {
+
+    public:
+    virtual bool BeginSourceFileAction(CompilerInstance &CI) override {
+        const auto &SM = CI.getSourceManager();
+        
+        // const std::string &filePath = SM.getFileEntryForID(SM.getMainFileID())->tryGetRealPathName().str();
+
+        // llvm::outs() << "File path: " << filePath << "\n";
+
+        return true;
+    }
+
+    virtual std::unique_ptr<ASTConsumer> CreateASTConsumer(
+            CompilerInstance& CI, StringRef file) override {
+
+        // Here we add any checks which require the preprocessor.
+        // At the moment, there are no checks registered
+
+        return std::unique_ptr<ASTConsumer>(
+                new ArgTypeASTConsumer(CI.getPreprocessor()));
+    }
+
+    virtual void EndSourceFileAction() override {
+        
+    }
+};
 
 // ----------------------------------------------------------------------------
 // OUR PROGRAM
@@ -312,6 +470,38 @@ bool filepathAccessible(std::string path)
 {   
     std::ifstream file(path);
     return file.is_open();
+}
+
+bool satisfyRules(std::vector<RefcntVal> &vec) {
+    bool setExist = false, incExist = false, decExist = false;  // Rule 1
+    bool setValueIsOne = true;                                  // Rule 2
+    bool incContainsOne = false, decContainsOne = false;        // Rule 3
+
+    for (auto &elem : vec) {
+        switch (elem.first) {
+        case APIType::SET:
+            setExist = true;
+            if (elem.second > 1) {
+                setValueIsOne = false;
+            }
+            break;
+        case APIType::DIFF:
+            if (elem.second > 0) {
+                incExist = true;
+                if (elem.second == 1) {
+                    incContainsOne = true;
+                }
+            }
+            else if (elem.second < 0) {
+                decExist = true;
+                if (elem.second == -1) {
+                    decContainsOne = true;
+                }
+            }
+            break;
+        }
+    }
+    return setExist && incExist && decExist && setValueIsOne && incContainsOne && decContainsOne;
 }
 
 int main(int argc, const char** argv)
@@ -327,6 +517,7 @@ int main(int argc, const char** argv)
             llvm::errs() << std::move(err);
             return EXIT_FAILURE;
         }
+    
 
         // Our program is meant to analyse source code, so if we didn't
         // get any filepaths, we print an error message and exit
@@ -335,7 +526,6 @@ int main(int argc, const char** argv)
             llvm::errs() << "Error: No input files specified\n";
             return EXIT_FAILURE;
         }
-
         // Also, if any of the filepaths we've received are invalid,
         // we also print an error message and exit
         for (auto path : files) {
@@ -344,9 +534,32 @@ int main(int argc, const char** argv)
                 return EXIT_FAILURE;
             }
         }
+
         ClangTool Tool(OptionsParser->getCompilations(), files);
         Tool.setDiagnosticConsumer(new WarningDiagConsumer);
-        Tool.run(newFrontendActionFactory<RefcntFrontEndAction>().get());
+        Tool.run(newFrontendActionFactory<FieldTypeFrontEndAction>().get());
+        system("rm -rf " LOG_DIR "*");
+
+        Tool.run(newFrontendActionFactory<ArgTypeFrontEndAction>().get());
+        system("rm -rf " LOG_DIR "*");
+        for (auto &elem : refcntCandidates) {
+            llvm::outs() << "Path: " << elem.first.first << ", "
+                         << "Line: " << elem.first.second << "\n";
+            for (auto &el : elem.second) {
+                switch (el.first) {
+                case APIType::SET:
+                    llvm::outs() << "   <SET,";
+                    break;
+                case APIType::DIFF:
+                    llvm::outs() << "   <DIFF,";
+                    break;
+                }
+                llvm::outs() << el.second << ">\n";
+            }
+        }
+        for (auto &elem : funcNames) {
+            llvm::outs() << elem << "\n";
+        }
     }
     else {
         std::string err_msg;
@@ -362,26 +575,71 @@ int main(int argc, const char** argv)
         // tool doesn't perform any analysis at all.
         ClangTool Tool(*database, database->getAllFiles());
         Tool.setDiagnosticConsumer(new WarningDiagConsumer);
-        Tool.run(newFrontendActionFactory<RefcntFrontEndAction>().get());
+        Tool.run(newFrontendActionFactory<FieldTypeFrontEndAction>().get());
+        system("rm -rf " LOG_DIR "*");
+        Tool.run(newFrontendActionFactory<ArgTypeFrontEndAction>().get());
+        system("rm -rf " LOG_DIR "*");
+
+        total_output.open(LOG_DIR "beforeRules.log");
+        if (!total_output.is_open()) {
+            llvm::errs() << "output file open failed!\n";
+            return EXIT_FAILURE;
+        }
+
+        for (auto &elem : refcntCandidates) {
+            total_output << "Path: " << elem.first.first << ", "
+                         << "Line: " << elem.first.second << "\n";
+            for (auto &el : elem.second) {
+                switch (el.first) {
+                case APIType::SET:
+                    total_output << "   <SET,";
+                    break;
+                case APIType::DIFF:
+                    total_output << "   <DIFF,";
+                    break;
+                }
+                total_output << el.second << ">\n";
+            }
+        }
+
+        total_output.close();
+        total_output.open(LOG_DIR "afterRules.log");
+        if (!total_output.is_open()) {
+            llvm::errs() << "output file open failed!\n";
+            return EXIT_FAILURE;
+        }
+
+        for (auto it = refcntCandidates.begin(); it != refcntCandidates.end(); ) {
+            if (!satisfyRules(it->second)) {
+                it = refcntCandidates.erase(it);
+            }
+            else {
+                ++it;
+            }
+        }
+
+        for (auto &elem : refcntCandidates) {
+            total_output << "Path: " << elem.first.first << ", "
+                         << "Line: " << elem.first.second << "\n";
+            for (auto &el : elem.second) {
+                switch (el.first) {
+                case APIType::SET:
+                    total_output << "   <SET,";
+                    break;
+                case APIType::DIFF:
+                    total_output << "   <DIFF,";
+                    break;
+                }
+                total_output << el.second << ">\n";
+            }
+        }
+        total_output.close();
+
+        total_output.open(LOG_DIR "funcNames.log");
+        for (auto &elem : funcNames) {
+            total_output << elem << "\n";
+        }
+        total_output.close();
     }
-
-    llvm::outs() << "atomic_t: " << total_refcnt.atomic_t_cnt << "\n"
-                 << "atomic_long_t: " << total_refcnt.atomic_long_t_cnt << "\n"
-                 << "atomic64_t: " << total_refcnt.atomic64_t_cnt << "\n"
-                 << "refcount_t: " << total_refcnt.refcount_t_cnt << "\n"
-                 << "kref: " << total_refcnt.kref_cnt << "\n";
-
-    total_output.open(LOG_DIR + std::string("log.txt"));
-    if (!total_output.is_open()) {
-        llvm::errs() << "output file open failed!\n";
-        return EXIT_FAILURE;
-    }
-
-    total_output << "atomic_t: " << total_refcnt.atomic_t_cnt << "\n"
-                 << "atomic_long_t: " << total_refcnt.atomic_long_t_cnt << "\n"
-                 << "atomic64_t: " << total_refcnt.atomic64_t_cnt << "\n"
-                 << "refcount_t: " << total_refcnt.refcount_t_cnt << "\n"
-                 << "kref: " << total_refcnt.kref_cnt << "\n";
-
     return EXIT_SUCCESS;
 }

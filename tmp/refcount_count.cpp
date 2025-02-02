@@ -227,7 +227,7 @@ class RefcntASTConsumer : public ASTConsumer {
                 ),
                 unless(hasAncestor(recordDecl(hasAnyName(
                     "kref",
-                    "refcount_t"
+                    "refcount_struct"
                 ))))
             ).bind("refcntType"),
             callback

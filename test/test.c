@@ -29,7 +29,7 @@ void atomic_dec(atomic_t *v) {
     (*v)--;
 }
 
-struct kref test;
+struct krefkref test;
 
 void func() {
     atomic_t wow;
@@ -37,9 +37,9 @@ void func() {
     struct kref good;
     atomic_t ref;
 
-    atomic_set(&test.u.four, 1);
-    atomic_add(-2, &test.u.four);
-    atomic_sub(-2, &test.u.four);
-    atomic_inc(&test.u.four);
-    atomic_dec(&test.u.four);
+    atomic_set(&test.two, 1);
+    atomic_add(-2, &test.two);
+    atomic_sub(-2, &test.two);
+    atomic_inc(&test.two);
+    atomic_dec(&test.two);
 }
